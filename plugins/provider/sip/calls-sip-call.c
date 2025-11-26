@@ -194,6 +194,26 @@ calls_sip_call_hang_up (CallsCall *call)
 
 
 static void
+calls_sip_call_send_dtmf_tone (CallsCall *call,
+                              char       key)
+{
+  CallsSipCall *self;
+
+  g_assert (CALLS_IS_CALL (call));
+  g_assert (CALLS_IS_SIP_CALL (call));
+
+  self = CALLS_SIP_CALL (call);
+
+  if (self->pipeline == NULL) {
+    g_warning ("Cannot send DTMF tone: media pipeline is not available");
+    return;
+  }
+
+  calls_sip_media_pipeline_send_dtmf (self->pipeline, key);
+}
+
+
+static void
 calls_sip_call_set_property (GObject      *object,
                              guint         property_id,
                              const GValue *value,
@@ -274,6 +294,7 @@ calls_sip_call_class_init (CallsSipCallClass *klass)
 
   call_class->answer = calls_sip_call_answer;
   call_class->hang_up = calls_sip_call_hang_up;
+  call_class->send_dtmf_tone = calls_sip_call_send_dtmf_tone;
 
   props[PROP_CALL_HANDLE] =
     g_param_spec_pointer ("nua-handle",

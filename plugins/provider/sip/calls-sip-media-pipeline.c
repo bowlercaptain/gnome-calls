@@ -83,15 +83,20 @@
 #define EL_ENCODER (1<<12)
 #define EL_DECODER (1<<13)
 
+#define EL_DTMF_SRC (1<<14)
+#define EL_DTMF_MUX (1<<15)
+
 #define EL_SENDING                                                \
   (EL_AUDIO_SRC | EL_ENCODER | EL_PAYLOADER |                     \
+   EL_DTMF_SRC | EL_DTMF_MUX |                                    \
    EL_RTPBIN | EL_RTP_SINK | EL_RTCP_SINK)
 
 #define EL_ALL_RTP                                                \
   (EL_PIPELINE | EL_RTPBIN |                                      \
    EL_RTP_SRC | EL_RTP_SINK | EL_RTCP_SRC | EL_RTCP_SINK |        \
    EL_AUDIO_SRC | EL_AUDIO_SINK |                                 \
-   EL_ENCODER | EL_DECODER | EL_PAYLOADER | EL_DEPAYLOADER)
+   EL_ENCODER | EL_DECODER | EL_PAYLOADER | EL_DEPAYLOADER |      \
+   EL_DTMF_SRC | EL_DTMF_MUX)
 
 #define EL_ALL_SRTP (EL_ALL_RTP | EL_SRTP_ENCODER | EL_SRTP_DECODER)
 
@@ -148,6 +153,10 @@ struct _CallsSipMediaPipeline {
   GstElement                  *audio_sink;
   GstElement                  *depayloader;
   GstElement                  *decoder;
+
+  /* DTMF */
+  GstElement                  *dtmf_src;
+  GstElement                  *dtmf_mux;
 
   /* SRTP */
   gboolean                     use_srtp;
@@ -346,6 +355,11 @@ on_bus_message (GstBus     *bus,
       element_id = EL_ENCODER;
     else if (message->src == GST_OBJECT (self->decoder))
       element_id = EL_DECODER;
+
+    else if (message->src == GST_OBJECT (self->dtmf_src))
+      element_id = EL_DTMF_SRC;
+    else if (message->src == GST_OBJECT (self->dtmf_mux))
+      element_id = EL_DTMF_MUX;
 
     unset_element_id = G_MAXUINT ^ element_id;
 
@@ -636,6 +650,10 @@ pipeline_init (CallsSipMediaPipeline *self,
   /* rtpbin */
   MAKE_ELEMENT (rtpbin, "rtpbin", "rtpbin");
 
+  /* DTMF elements */
+  MAKE_ELEMENT (dtmf_src, "rtpdtmfsrc", "dtmf-src");
+  MAKE_ELEMENT (dtmf_mux, "rtpdtmfmux", "dtmf-mux");
+
   /* srtp elements */
   MAKE_ELEMENT (srtpdec, "srtpdec", "srtpdec");
   g_signal_connect (self->srtpdec,
@@ -745,18 +763,18 @@ pipeline_link_elements (CallsSipMediaPipeline *self,
 
   g_assert (CALLS_IS_SIP_MEDIA_PIPELINE (self));
 
-  /* link to payloader */
+  /* link to dtmf_mux output (which muxes audio and DTMF) */
 
 #if GST_CHECK_VERSION (1, 20, 0)
   sinkpad = gst_element_request_pad_simple (self->rtpbin, "send_rtp_sink_0");
 #else
   sinkpad = gst_element_get_request_pad (self->rtpbin, "send_rtp_sink_0");
 #endif
-  srcpad = gst_element_get_static_pad (self->payloader, "src");
+  srcpad = gst_element_get_static_pad (self->dtmf_mux, "src");
   if (gst_pad_link (srcpad, sinkpad) != GST_PAD_LINK_OK) {
     if (error)
       g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                   "Failed to link payloader to rtpbin");
+                   "Failed to link dtmf_mux to rtpbin");
     return FALSE;
   }
 
@@ -861,12 +879,22 @@ pipeline_setup_codecs (CallsSipMediaPipeline *self,
   gst_bin_add_many (GST_BIN (self->pipeline),
                     self->depayloader, self->decoder,
                     self->payloader, self->encoder,
+                    self->dtmf_src, self->dtmf_mux,
                     NULL);
 
-  if (!gst_element_link_many (self->audio_src, self->encoder, self->payloader, NULL)) {
+  /* Link audio source through encoder and payloader to DTMF mux */
+  if (!gst_element_link_many (self->audio_src, self->encoder, self->payloader, self->dtmf_mux, NULL)) {
     if (error)
       g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                   "Failed to link audiosrc encoder and payloader");
+                   "Failed to link audiosrc encoder payloader and dtmf_mux");
+    return FALSE;
+  }
+
+  /* Link DTMF source to mux */
+  if (!gst_element_link (self->dtmf_src, self->dtmf_mux)) {
+    if (error)
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                   "Failed to link dtmf_src to dtmf_mux");
     return FALSE;
   }
 
@@ -1520,4 +1548,63 @@ calls_sip_media_pipeline_get_state (CallsSipMediaPipeline *self)
                         CALLS_MEDIA_PIPELINE_STATE_UNKNOWN);
 
   return self->state;
+}
+
+/* DTMF volume in dB (0 = max, higher values = quieter)
+ * Standard range is 0-63 dB, 25 dB is a reasonable default */
+#define DTMF_VOLUME_DB 25
+
+/**
+ * calls_sip_media_pipeline_send_dtmf:
+ * @self: a #CallsSipMediaPipeline
+ * @key: the DTMF key to send (0-9, A-D, *, #)
+ *
+ * Sends a DTMF tone through the media pipeline. The tone duration
+ * is controlled by the rtpdtmfsrc element's configuration.
+ * This method sends a start event; the element will automatically
+ * generate the appropriate RTP packets for the configured duration.
+ */
+void
+calls_sip_media_pipeline_send_dtmf (CallsSipMediaPipeline *self,
+                                   char                   key)
+{
+  gint dtmf_event;
+  gboolean result;
+
+  g_return_if_fail (CALLS_IS_SIP_MEDIA_PIPELINE (self));
+  g_return_if_fail (self->dtmf_src != NULL);
+
+  /* Convert key to DTMF event number according to RFC 4733 */
+  if (key >= '0' && key <= '9') {
+    dtmf_event = key - '0';
+  } else if (key == '*') {
+    dtmf_event = 10;
+  } else if (key == '#') {
+    dtmf_event = 11;
+  } else if (key >= 'A' && key <= 'D') {
+    dtmf_event = 12 + (key - 'A');
+  } else if (key >= 'a' && key <= 'd') {
+    dtmf_event = 12 + (key - 'a');
+  } else {
+    g_warning ("Invalid DTMF key: %c", key);
+    return;
+  }
+
+  g_debug ("Sending DTMF tone: %c (event %d)", key, dtmf_event);
+
+  /* Use the rtpdtmfsrc's "start-telephony-event" signal to send DTMF.
+   * Volume is specified in dB (0 = maximum volume, higher = quieter).
+   * The element will automatically send the tone for its configured
+   * duration and then stop. */
+  g_signal_emit_by_name (self->dtmf_src, "start-telephony-event",
+                        dtmf_event, DTMF_VOLUME_DB, &result);
+
+  if (!result) {
+    g_warning ("Failed to start DTMF telephony event for key %c", key);
+  }
+
+  /* Note: We don't call stop-telephony-event here because rtpdtmfsrc
+   * automatically handles the duration and stop timing based on its
+   * configuration. Calling stop immediately would prevent the tone
+   * from being audible. */
 }
