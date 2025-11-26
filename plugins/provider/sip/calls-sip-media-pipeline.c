@@ -1550,12 +1550,19 @@ calls_sip_media_pipeline_get_state (CallsSipMediaPipeline *self)
   return self->state;
 }
 
+/* DTMF volume in dB (0 = max, higher values = quieter)
+ * Standard range is 0-63 dB, 25 dB is a reasonable default */
+#define DTMF_VOLUME_DB 25
+
 /**
  * calls_sip_media_pipeline_send_dtmf:
  * @self: a #CallsSipMediaPipeline
  * @key: the DTMF key to send (0-9, A-D, *, #)
  *
- * Sends a DTMF tone through the media pipeline.
+ * Sends a DTMF tone through the media pipeline. The tone duration
+ * is controlled by the rtpdtmfsrc element's configuration.
+ * This method sends a start event; the element will automatically
+ * generate the appropriate RTP packets for the configured duration.
  */
 void
 calls_sip_media_pipeline_send_dtmf (CallsSipMediaPipeline *self,
@@ -1585,18 +1592,19 @@ calls_sip_media_pipeline_send_dtmf (CallsSipMediaPipeline *self,
 
   g_debug ("Sending DTMF tone: %c (event %d)", key, dtmf_event);
 
-  /* Use the rtpdtmfsrc's "start-telephony-event" signal to send DTMF */
+  /* Use the rtpdtmfsrc's "start-telephony-event" signal to send DTMF.
+   * Volume is specified in dB (0 = maximum volume, higher = quieter).
+   * The element will automatically send the tone for its configured
+   * duration and then stop. */
   g_signal_emit_by_name (self->dtmf_src, "start-telephony-event",
-                        dtmf_event, 25, &result);
+                        dtmf_event, DTMF_VOLUME_DB, &result);
 
   if (!result) {
     g_warning ("Failed to start DTMF telephony event for key %c", key);
   }
 
-  /* The element will automatically stop the tone after the configured duration */
-  g_signal_emit_by_name (self->dtmf_src, "stop-telephony-event", &result);
-
-  if (!result) {
-    g_warning ("Failed to stop DTMF telephony event for key %c", key);
-  }
+  /* Note: We don't call stop-telephony-event here because rtpdtmfsrc
+   * automatically handles the duration and stop timing based on its
+   * configuration. Calling stop immediately would prevent the tone
+   * from being audible. */
 }
