@@ -149,6 +149,10 @@ struct _CallsSipMediaPipeline {
   GstElement                  *depayloader;
   GstElement                  *decoder;
 
+  /* DTMF */
+  GstElement                  *dtmf_src;
+  GstElement                  *dtmf_mux;
+
   /* SRTP */
   gboolean                     use_srtp;
   calls_srtp_crypto_attribute *crypto_own;
@@ -636,6 +640,10 @@ pipeline_init (CallsSipMediaPipeline *self,
   /* rtpbin */
   MAKE_ELEMENT (rtpbin, "rtpbin", "rtpbin");
 
+  /* DTMF elements */
+  MAKE_ELEMENT (dtmf_src, "rtpdtmfsrc", "dtmf-src");
+  MAKE_ELEMENT (dtmf_mux, "rtpdtmfmux", "dtmf-mux");
+
   /* srtp elements */
   MAKE_ELEMENT (srtpdec, "srtpdec", "srtpdec");
   g_signal_connect (self->srtpdec,
@@ -745,18 +753,18 @@ pipeline_link_elements (CallsSipMediaPipeline *self,
 
   g_assert (CALLS_IS_SIP_MEDIA_PIPELINE (self));
 
-  /* link to payloader */
+  /* link to dtmf_mux output (which muxes audio and DTMF) */
 
 #if GST_CHECK_VERSION (1, 20, 0)
   sinkpad = gst_element_request_pad_simple (self->rtpbin, "send_rtp_sink_0");
 #else
   sinkpad = gst_element_get_request_pad (self->rtpbin, "send_rtp_sink_0");
 #endif
-  srcpad = gst_element_get_static_pad (self->payloader, "src");
+  srcpad = gst_element_get_static_pad (self->dtmf_mux, "src");
   if (gst_pad_link (srcpad, sinkpad) != GST_PAD_LINK_OK) {
     if (error)
       g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                   "Failed to link payloader to rtpbin");
+                   "Failed to link dtmf_mux to rtpbin");
     return FALSE;
   }
 
@@ -861,12 +869,22 @@ pipeline_setup_codecs (CallsSipMediaPipeline *self,
   gst_bin_add_many (GST_BIN (self->pipeline),
                     self->depayloader, self->decoder,
                     self->payloader, self->encoder,
+                    self->dtmf_src, self->dtmf_mux,
                     NULL);
 
-  if (!gst_element_link_many (self->audio_src, self->encoder, self->payloader, NULL)) {
+  /* Link audio source through encoder and payloader to DTMF mux */
+  if (!gst_element_link_many (self->audio_src, self->encoder, self->payloader, self->dtmf_mux, NULL)) {
     if (error)
       g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                   "Failed to link audiosrc encoder and payloader");
+                   "Failed to link audiosrc encoder payloader and dtmf_mux");
+    return FALSE;
+  }
+
+  /* Link DTMF source to mux */
+  if (!gst_element_link (self->dtmf_src, self->dtmf_mux)) {
+    if (error)
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                   "Failed to link dtmf_src to dtmf_mux");
     return FALSE;
   }
 
@@ -1520,4 +1538,61 @@ calls_sip_media_pipeline_get_state (CallsSipMediaPipeline *self)
                         CALLS_MEDIA_PIPELINE_STATE_UNKNOWN);
 
   return self->state;
+}
+
+/**
+ * calls_sip_media_pipeline_send_dtmf:
+ * @self: a #CallsSipMediaPipeline
+ * @key: the DTMF key to send (0-9, A-D, *, #)
+ *
+ * Sends a DTMF tone through the media pipeline.
+ */
+void
+calls_sip_media_pipeline_send_dtmf (CallsSipMediaPipeline *self,
+                                   char                   key)
+{
+  GstStructure *event_structure;
+  GstEvent *event;
+  gint dtmf_event;
+
+  g_return_if_fail (CALLS_IS_SIP_MEDIA_PIPELINE (self));
+  g_return_if_fail (self->dtmf_src != NULL);
+
+  /* Convert key to DTMF event number according to RFC 4733 */
+  if (key >= '0' && key <= '9') {
+    dtmf_event = key - '0';
+  } else if (key == '*') {
+    dtmf_event = 10;
+  } else if (key == '#') {
+    dtmf_event = 11;
+  } else if (key >= 'A' && key <= 'D') {
+    dtmf_event = 12 + (key - 'A');
+  } else if (key >= 'a' && key <= 'd') {
+    dtmf_event = 12 + (key - 'a');
+  } else {
+    g_warning ("Invalid DTMF key: %c", key);
+    return;
+  }
+
+  g_debug ("Sending DTMF tone: %c (event %d)", key, dtmf_event);
+
+  /* Create and send start-tone event */
+  event_structure = gst_structure_new ("dtmf-event",
+                                       "type", G_TYPE_INT, 1,
+                                       "number", G_TYPE_INT, dtmf_event,
+                                       "volume", G_TYPE_INT, 25,
+                                       "start", G_TYPE_BOOLEAN, TRUE,
+                                       NULL);
+  event = gst_event_new_custom (GST_EVENT_CUSTOM_UPSTREAM, event_structure);
+  gst_element_send_event (self->dtmf_src, event);
+
+  /* Create and send stop-tone event */
+  event_structure = gst_structure_new ("dtmf-event",
+                                       "type", G_TYPE_INT, 1,
+                                       "number", G_TYPE_INT, dtmf_event,
+                                       "volume", G_TYPE_INT, 25,
+                                       "start", G_TYPE_BOOLEAN, FALSE,
+                                       NULL);
+  event = gst_event_new_custom (GST_EVENT_CUSTOM_UPSTREAM, event_structure);
+  gst_element_send_event (self->dtmf_src, event);
 }
