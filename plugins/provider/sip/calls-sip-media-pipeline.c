@@ -83,15 +83,20 @@
 #define EL_ENCODER (1<<12)
 #define EL_DECODER (1<<13)
 
+#define EL_DTMF_SRC (1<<14)
+#define EL_DTMF_MUX (1<<15)
+
 #define EL_SENDING                                                \
   (EL_AUDIO_SRC | EL_ENCODER | EL_PAYLOADER |                     \
+   EL_DTMF_SRC | EL_DTMF_MUX |                                    \
    EL_RTPBIN | EL_RTP_SINK | EL_RTCP_SINK)
 
 #define EL_ALL_RTP                                                \
   (EL_PIPELINE | EL_RTPBIN |                                      \
    EL_RTP_SRC | EL_RTP_SINK | EL_RTCP_SRC | EL_RTCP_SINK |        \
    EL_AUDIO_SRC | EL_AUDIO_SINK |                                 \
-   EL_ENCODER | EL_DECODER | EL_PAYLOADER | EL_DEPAYLOADER)
+   EL_ENCODER | EL_DECODER | EL_PAYLOADER | EL_DEPAYLOADER |      \
+   EL_DTMF_SRC | EL_DTMF_MUX)
 
 #define EL_ALL_SRTP (EL_ALL_RTP | EL_SRTP_ENCODER | EL_SRTP_DECODER)
 
@@ -350,6 +355,11 @@ on_bus_message (GstBus     *bus,
       element_id = EL_ENCODER;
     else if (message->src == GST_OBJECT (self->decoder))
       element_id = EL_DECODER;
+
+    else if (message->src == GST_OBJECT (self->dtmf_src))
+      element_id = EL_DTMF_SRC;
+    else if (message->src == GST_OBJECT (self->dtmf_mux))
+      element_id = EL_DTMF_MUX;
 
     unset_element_id = G_MAXUINT ^ element_id;
 
@@ -1551,9 +1561,8 @@ void
 calls_sip_media_pipeline_send_dtmf (CallsSipMediaPipeline *self,
                                    char                   key)
 {
-  GstStructure *event_structure;
-  GstEvent *event;
   gint dtmf_event;
+  gboolean result;
 
   g_return_if_fail (CALLS_IS_SIP_MEDIA_PIPELINE (self));
   g_return_if_fail (self->dtmf_src != NULL);
@@ -1576,23 +1585,18 @@ calls_sip_media_pipeline_send_dtmf (CallsSipMediaPipeline *self,
 
   g_debug ("Sending DTMF tone: %c (event %d)", key, dtmf_event);
 
-  /* Create and send start-tone event */
-  event_structure = gst_structure_new ("dtmf-event",
-                                       "type", G_TYPE_INT, 1,
-                                       "number", G_TYPE_INT, dtmf_event,
-                                       "volume", G_TYPE_INT, 25,
-                                       "start", G_TYPE_BOOLEAN, TRUE,
-                                       NULL);
-  event = gst_event_new_custom (GST_EVENT_CUSTOM_UPSTREAM, event_structure);
-  gst_element_send_event (self->dtmf_src, event);
+  /* Use the rtpdtmfsrc's "start-telephony-event" signal to send DTMF */
+  g_signal_emit_by_name (self->dtmf_src, "start-telephony-event",
+                        dtmf_event, 25, &result);
 
-  /* Create and send stop-tone event */
-  event_structure = gst_structure_new ("dtmf-event",
-                                       "type", G_TYPE_INT, 1,
-                                       "number", G_TYPE_INT, dtmf_event,
-                                       "volume", G_TYPE_INT, 25,
-                                       "start", G_TYPE_BOOLEAN, FALSE,
-                                       NULL);
-  event = gst_event_new_custom (GST_EVENT_CUSTOM_UPSTREAM, event_structure);
-  gst_element_send_event (self->dtmf_src, event);
+  if (!result) {
+    g_warning ("Failed to start DTMF telephony event for key %c", key);
+  }
+
+  /* The element will automatically stop the tone after the configured duration */
+  g_signal_emit_by_name (self->dtmf_src, "stop-telephony-event", &result);
+
+  if (!result) {
+    g_warning ("Failed to stop DTMF telephony event for key %c", key);
+  }
 }
